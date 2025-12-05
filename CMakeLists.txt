@@ -22,20 +22,25 @@ set(HASHTABLE_HDRS
     utils/TraceConfig.hpp
 )
 
-# ------------------------------
-# provided program
-# ------------------------------
+
 add_executable(HashTablesOpenAddressing
     main.cpp
     ${HASHTABLE_SRCS}
     ${HASHTABLE_HDRS}
 )
 
-# ------------------------------
-# Your LRU harness
-# ------------------------------
+
 add_executable(lru_harness
     lru_harness.cpp
     ${HASHTABLE_SRCS}
     ${HASHTABLE_HDRS}
 )
+
+
+add_executable(lru_tracegen
+    lru_tracegen.cpp
+    ${HASHTABLE_SRCS}
+    ${HASHTABLE_HDRS}
+)
+
+

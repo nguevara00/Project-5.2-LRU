@@ -1,0 +1,380 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>LRU Hash Table Map — Before/After Compaction Histogram</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 20px; }
+  h1 { margin: 0 0 10px; font-size: 20px; }
+  .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; align-items: center; margin-bottom: 12px; }
+  .panel { border: 1px solid #ddd; border-radius: 10px; padding: 12px; background: #fafafa; }
+  label { font-size: 14px; display: block; margin-bottom: 4px; color: #333; }
+  input[type="file"] { width: 100%; }
+  select, input[type="number"] { width: 100%; padding: 6px 8px; border-radius: 8px; border: 1px solid #ccc; }
+  .meta { font-size: 14px; color: #444; margin: 6px 0 12px; }
+  .chart-wrap { border: 1px solid #eee; border-radius: 10px; padding: 10px; }
+  .legend { display: flex; gap: 12px; margin: 6px 0 12px; align-items: center; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 14px; color: #333; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; }
+  .summary { margin-top: 10px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; border-radius: 8px; overflow: hidden; }
+  th, td { font-size: 13px; padding: 6px 8px; border-bottom: 1px solid #eee; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  .footnote { font-size: 12px; color: #666; margin-top: 8px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>LRU Map Histogram — Before vs After Compaction</h1>
+
+<div class="controls panel">
+  <div>
+    <label>Upload map file</label>
+    <input id="fileInput" type="file" accept=".txt,.csv,.log,.dat,.map"/>
+  </div>
+  <div>
+    <label>Run target</label>
+    <select id="targetSelect">
+      <option value="1">ACTIVE runs (1s)</option>
+      <option value="0">INACTIVE runs (0s)</option>
+    </select>
+  </div>
+  <div>
+    <label>Binning</label>
+    <select id="binMode">
+      <option value="log">Log-ish bins (1, 2, 3–4, 5–8, ...)</option>
+      <option value="linear">Linear bins (width)</option>
+    </select>
+  </div>
+  <div id="linearWidthWrap" class="">
+    <label>Linear bin width</label>
+    <input id="linearWidth" type="number" min="1" step="1" value="2"/>
+  </div>
+  <div>
+    <label>Normalize</label>
+    <select id="normalize">
+      <option value="count">Counts</option>
+      <option value="percent">Percent of runs</option>
+    </select>
+  </div>
+</div>
+
+<div id="meta" class="meta">No file loaded.</div>
+
+<div class="chart-wrap panel">
+  <div class="legend">
+    <div class="legend-item"><div class="legend-swatch" style="background:#4e79a7;"></div>Before compaction</div>
+    <div class="legend-item"><div class="legend-swatch" style="background:#f28e2b;"></div>After compaction</div>
+  </div>
+  <svg id="chart" width="960" height="420" role="img" aria-label="Histogram of run lengths"></svg>
+</div>
+
+<div class="summary panel">
+  <div>
+    <table id="summaryBefore">
+      <thead><tr><th colspan="2">Before compaction — summary</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div>
+    <table id="summaryAfter">
+      <thead><tr><th colspan="2">After compaction — summary</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<p class="footnote">Tip: The parser ignores all non-0/1 characters in the map blocks. It reads the first non-empty block after the header as “before” and the second as “after”.</p>
+
+<script>
+const svg = d3.select("#chart");
+const W = 960, H = 420, M = {top: 20, right: 20, bottom: 60, left: 60};
+const innerW = W - M.left - M.right;
+const innerH = H - M.top - M.bottom;
+const g = svg.attr("width", W).attr("height", H).append("g").attr("transform", `translate(${M.left},${M.top})`);
+
+const color = d3.scaleOrdinal().domain(["before", "after"]).range(["#4e79a7", "#f28e2b"]);
+
+const xScale = d3.scaleBand().padding(0.15).range([0, innerW]);
+const x1 = d3.scaleBand().padding(0.05); // for grouped bars
+const yScale = d3.scaleLinear().range([innerH, 0]);
+
+const xAxisG = g.append("g").attr("transform", `translate(0,${innerH})`);
+const yAxisG = g.append("g");
+
+const xLabel = g.append("text")
+  .attr("x", innerW/2).attr("y", innerH + 48)
+  .attr("text-anchor", "middle").style("font-size", "12px")
+  .text("Run length bins");
+
+const yLabel = g.append("text")
+  .attr("transform", "rotate(-90)")
+  .attr("x", -innerH/2).attr("y", -44)
+  .attr("text-anchor", "middle").style("font-size", "12px")
+  .text("Count");
+
+const metaBox = d3.select("#meta");
+
+const targetSelect = d3.select("#targetSelect");
+const binMode = d3.select("#binMode");
+const linearWidth = d3.select("#linearWidth");
+const linearWidthWrap = d3.select("#linearWidthWrap");
+const normalizeSel = d3.select("#normalize");
+
+binMode.on("change", () => {
+  const mode = binMode.node().value;
+  linearWidthWrap.classed("hidden", mode !== "linear");
+  redraw();
+});
+targetSelect.on("change", redraw);
+linearWidth.on("input", redraw);
+normalizeSel.on("change", redraw);
+
+document.getElementById("fileInput").addEventListener("change", handleFile);
+
+let state = {
+  header: "",
+  beforeBits: "",
+  afterBits: ""
+};
+
+function handleFile(ev) {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const text = reader.result;
+    state = parseMapFile(text);
+    const hdrStr = state.header ? state.header : "(no header)";
+    const bLen = (state.beforeBits.match(/[01]/g) || []).length;
+    const aLen = (state.afterBits.match(/[01]/g) || []).length;
+    metaBox.text(`Header: ${hdrStr} — parsed lengths: before=${bLen} bits, after=${aLen} bits`);
+    redraw();
+  };
+  reader.readAsText(file);
+}
+
+function parseMapFile(text) {
+  const lines = text.split(/\r?\n/);
+  const header = (lines[0] || "").trim();
+  let blocks = [];
+  let cur = [];
+  for (let i=1; i<lines.length; i++) {
+    const raw = lines[i] || "";
+    const line = raw.replace(/[^01]/g, ""); // keep only 0/1
+    if (raw.trim() === "") {
+      if (cur.length) { blocks.push(cur.join("")); cur = []; }
+    } else {
+      cur.push(line);
+    }
+  }
+  if (cur.length) blocks.push(cur.join(""));
+
+  // Expect blocks[0] = before, blocks[1] = after
+  return {
+    header,
+    beforeBits: blocks[0] || "",
+    afterBits: blocks[1] || ""
+  };
+}
+
+function runLengths(bits, targetChar) {
+  const out = [];
+  let run = 0;
+  for (let i=0; i<bits.length; i++) {
+    const ch = bits[i];
+    if (ch === targetChar) {
+      run++;
+    } else if (run > 0) {
+      out.push(run);
+      run = 0;
+    }
+  }
+  if (run > 0) out.push(run);
+  return out;
+}
+
+function logishBins(maxLen) {
+  const bins = [];
+  if (maxLen <= 0) return bins;
+  bins.push([1,1]);
+  if (maxLen >= 2) bins.push([2,2]);
+  let start = 3, end = 4;
+  while (start <= maxLen) {
+    if (end > maxLen) end = maxLen;
+    bins.push([start, end]);
+    start = end + 1;
+    end = end * 2;
+  }
+  return bins;
+}
+
+function linearBins(maxLen, width) {
+  const bins = [];
+  if (width <= 0) width = 1;
+  for (let start = 1; start <= maxLen; start += width) {
+    let end = Math.min(maxLen, start + width - 1);
+    bins.push([start, end]);
+  }
+  return bins;
+}
+
+function summarize(runs) {
+  if (!runs.length) {
+    return {count:0, mean:0, median:0, p90:0, p95:0, max:0};
+  }
+  const sorted = [...runs].sort((a,b)=>a-b);
+  const count = runs.length;
+  const sum = runs.reduce((a,b)=>a+b, 0);
+  const mean = sum / count;
+  const median = sorted[Math.floor((count-1)/2)];
+  const p90 = sorted[Math.floor(0.90*(count-1))];
+  const p95 = sorted[Math.floor(0.95*(count-1))];
+  const max = sorted[sorted.length-1];
+  return {count, mean, median, p90, p95, max};
+}
+
+function formatSummary(sel, title, runs, bitCount) {
+  const s = summarize(runs);
+  const tbody = sel.select("tbody");
+  tbody.selectAll("tr").remove();
+  const rows = [
+    ["Runs counted", s.count.toLocaleString()],
+    ["Bits scanned", bitCount.toLocaleString()],
+    ["Mean run length", s.mean.toFixed(2)],
+    ["Median run length", s.median],
+    ["p90 run length", s.p90],
+    ["p95 run length", s.p95],
+    ["Max run length", s.max]
+  ];
+  rows.forEach(r => {
+    const tr = tbody.append("tr");
+    tr.append("td").text(r[0]);
+    tr.append("td").text(r[1]);
+  });
+}
+
+function redraw() {
+  const targetChar = targetSelect.node().value;
+  const mode = binMode.node().value;
+  const lwidth = +linearWidth.node().value || 1;
+  const normalize = normalizeSel.node().value;
+
+  if (!state.beforeBits || !state.afterBits) {
+    // Clear chart
+    g.selectAll(".barGroup").remove();
+    xAxisG.selectAll("*").remove();
+    yAxisG.selectAll("*").remove();
+    d3.select("#summaryBefore tbody").selectAll("*").remove();
+    d3.select("#summaryAfter tbody").selectAll("*").remove();
+    return;
+  }
+
+  const runsBefore = runLengths(state.beforeBits, targetChar);
+  const runsAfter  = runLengths(state.afterBits, targetChar);
+
+  const maxLen = Math.max(1, d3.max([0, d3.max(runsBefore), d3.max(runsAfter)]));
+  const bins = (mode === "log") ? logishBins(maxLen) : linearBins(maxLen, lwidth);
+
+  // Tally into bins
+  function tally(runs) {
+    const counts = bins.map(([lo,hi]) => 0);
+    for (const r of runs) {
+      for (let i=0; i<bins.length; i++) {
+        const [lo, hi] = bins[i];
+        if (r >= lo && r <= hi) { counts[i]++; break; }
+      }
+    }
+    return counts;
+  }
+  const cBefore = tally(runsBefore);
+  const cAfter  = tally(runsAfter);
+
+  // Normalize if needed
+  let yLabelText = (normalize === "percent") ? "Percent of runs (%)" : "Count";
+  const totalB = d3.sum(cBefore) || 1;
+  const totalA = d3.sum(cAfter) || 1;
+  const yDataBefore = (normalize === "percent") ? cBefore.map(v => 100*v/totalB) : cBefore;
+  const yDataAfter  = (normalize === "percent") ? cAfter.map(v => 100*v/totalA) : cAfter;
+
+  // Build dataset for grouped bars
+  const labels = bins.map(([lo,hi]) => (lo===hi) ? `${lo}` : `${lo}–${hi}`);
+  const data = labels.map((label, i) => ({
+    label,
+    before: yDataBefore[i],
+    after:  yDataAfter[i]
+  }));
+
+  // Scales
+  xScale.domain(labels);
+  x1.domain(["before","after"]).range([0, xScale.bandwidth()]);
+  yScale.domain([0, d3.max([d3.max(yDataBefore), d3.max(yDataAfter)]) || 1]).nice();
+
+
+  // Axes
+  const xAxis = d3.axisBottom(xScale);
+
+  // For linear binning, reduce clutter by showing every 5th bin label
+  if (mode === "linear") {
+    const step = 5;
+    const tickVals = labels.filter((_, i) => i % step === 0 || i === labels.length - 1);
+    xAxis.tickValues(tickVals);
+  }
+
+  const yAxis = d3.axisLeft(yScale).ticks(6);
+  xAxisG.call(xAxis).selectAll("text").style("font-size","11px").attr("transform","rotate(0)").style("text-anchor","middle");
+  yAxisG.call(yAxis).selectAll("text").style("font-size","11px");
+
+  yLabel.text(yLabelText);
+
+  // Bars
+  const groups = g.selectAll(".barGroup").data(data, d => d.label);
+  groups.exit().remove();
+  const groupsEnter = groups.enter().append("g").attr("class", "barGroup")
+    .attr("transform", d => `translate(${xScale(d.label)},0)`);
+
+  const merged = groupsEnter.merge(groups)
+    .attr("transform", d => `translate(${xScale(d.label)},0)`);
+
+  const bars = merged.selectAll("rect").data(d => [
+    {k:"before", v:d.before},
+    {k:"after", v:d.after}
+  ], d => d.k);
+
+  bars.enter().append("rect")
+    .attr("x", d => x1(d.k))
+    .attr("y", innerH)
+    .attr("width", x1.bandwidth())
+    .attr("height", 0)
+    .attr("fill", d => color(d.k))
+    .merge(bars)
+    .transition().duration(400)
+    .attr("x", d => x1(d.k))
+    .attr("y", d => yScale(d.v))
+    .attr("width", x1.bandwidth())
+    .attr("height", d => innerH - yScale(d.v));
+
+  bars.exit().remove();
+
+  // Tooltips (simple title)
+  merged.selectAll("rect").select(function(d){
+    // ensure a title node exists
+    let t = d3.select(this).select("title");
+    if (t.empty()) t = d3.select(this).append("title");
+    const label = d3.select(this.parentNode).datum().label;
+    const fmt = (normalize==="percent") ? (v => v.toFixed(2)+"%") : (v => d3.format(",")(v));
+    t.text(`${d.k} — bin ${label}: ${fmt(d.v)}`);
+    return this;
+  });
+
+  // Summaries
+  formatSummary(d3.select("#summaryBefore"), "Before", runsBefore, state.beforeBits.length);
+  formatSummary(d3.select("#summaryAfter"),  "After",  runsAfter,  state.afterBits.length);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Hash Tables — LRU Profile (Time / Probes / Occupancy / Throughput)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --fg:#111827; --muted:#6b7280; --border:#e5e7eb; --card:#ffffff; --bg:#f8fafc; }
+  html, body { margin:0; padding:0; background:var(--bg); color: var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", sans-serif; }
+  .container { max-width: 1040px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 1.25rem; margin: 0 0 12px 0; }
+  .card { background: var(--card); border:1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .row { display:flex; gap:12px; flex-wrap: wrap; align-items: center; }
+  label { display:flex; align-items:center; gap:8px; }
+  input[type="file"] { padding:6px 8px; }
+  select { padding:6px 8px; border:1px solid var(--border); border-radius:8px; background:#fff; }
+  #chart { height: 540px; position: relative; }
+  .legend { display:flex; gap:12px; flex-wrap: wrap; margin-top: 8px; }
+  .badge { display:inline-flex; align-items:center; gap:8px; padding:4px 10px; border:1px solid var(--border); border-radius: 999px; background:#fff; font-size: 12px; }
+  .dot { width:10px; height:10px; border-radius:999px; display:inline-block; }
+  .footer { color: var(--muted); font-size: .9rem; margin-top: 12px; }
+  .axis text { font-size: 12px; fill: #374151; }
+  .axis path, .axis line { stroke: #94a3b8; }
+  .grid line { stroke: #e5e7eb; }
+  .grid .domain { display: none; }
+  button { padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: #f9fafb; cursor: pointer; }
+  button:hover { background:#f3f4f6; }
+  .note { color: var(--muted); font-size: 12px; margin-left:6px; }
+
+  /* Tooltip */
+  .tooltip {
+    position: fixed;
+    pointer-events: none;
+    background: #fff;
+    border: 1px solid var(--border);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+    border-radius: 10px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--fg);
+    z-index: 20;
+    white-space: nowrap;
+  }
+  .tooltip .hdr { font-weight: 600; margin-bottom: 2px; }
+  .tooltip .sub { color: var(--muted); }
+
+  /* Small inline legend for line styles */
+  .styles { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-left: 8px; color: var(--muted); font-size:12px; }
+  .sw { display:inline-block; width:22px; height:0; border-top:2px solid #6b7280; }
+  .sw.dash { border-top-style: dashed; }
+  .sw.dot  { border-top-style: dotted; border-top-width: 3px; }
+</style>
+</head>
+<body>
+  <div class="container">
+    <h1>Hash Tables — LRU Profile</h1>
+
+    <div class="card">
+      <div class="row">
+        <label>CSV file <input type="file" id="file" accept=".csv" /></label>
+        <button id="useDefault">Load example</button>
+        <label>Metric
+          <select id="metric">
+            <option value="elapsed_ms">Elapsed time (ms)</option>
+            <option value="ops_per_ms">Throughput (ops/ms)</option>
+            <option value="ms_per_op">Latency (ms/op)</option>
+            <option value="average_probes">Average probes</option>
+            <option value="full_scans">Full scans (count)</option>
+            <option value="compactions">Compactions (count)</option>
+            <option value="eff_load_factor_pct">Effective load factor (%)</option>
+            <option value="load_factor_pct">Load factor (%)</option>
+            <option value="tombstones_pct">Tombstones (%)</option>
+            <option value="occupancy_trio_pct">Occupancy trio (eff/load/tomb, %)</option>
+          </select>
+        </label>
+        <label id="nlognWrap"><input type="checkbox" id="toggleNlogN"> N log N baseline (for elapsed time)</label>
+        <span class="styles" id="styleLegend" style="display:none;">
+          <span><span class="sw"></span> effective</span>
+          <span><span class="sw dash"></span> load</span>
+          <span><span class="sw dot"></span> tombstones</span>
+        </span>
+        <span class="note" id="metricNote"></span>
+      </div>
+    </div>
+
+    <div id="chart" class="card"></div>
+    <div id="legend" class="legend"></div>
+    <div class="footer">
+      X-axis is log₂ and starts at 2¹⁰. Rows with N &lt; 2¹⁰ are omitted by design.<br/>
+      Expected columns: <code>impl,profile,trace_path,N,seed,elapsed_ms,ops_total,average_probes,eff_load_factor_pct,load_factor_pct,tombstones_pct,full_scans,compactions,compaction_state</code>.
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <script>
+  const defaultCsv = `impl,profile,trace_path,N,seed,elapsed_ms,ops_total,average_probes,eff_load_factor_pct,load_factor_pct,tombstones_pct,full_scans,compactions,compaction_state
+hash_map_single,lru_profile,lru_profile_N_1024_S_23.trace,1024,23,25.1551,27380,16.17,92,80,12,0,26,compaction_on
+hash_map_double,lru_profile,lru_profile_N_1024_S_23.trace,1024,23,32.9419,27380,6.43,93,80,13,0,32,compaction_on
+hash_map_single,lru_profile,lru_profile_N_4096_S_23.trace,4096,23,103.637,109001,17.60,91,80,11,0,27,compaction_on
+hash_map_double,lru_profile,lru_profile_N_4096_S_23.trace,4096,23,117.261,109001,6.53,91,80,11,0,33,compaction_on
+hash_map_single,lru_profile,lru_profile_N_16384_S_23.trace,16384,23,398.085,436365,17.47,92,80,13,0,25,compaction_on
+hash_map_double,lru_profile,lru_profile_N_16384_S_23.trace,16384,23,463.496,436365,6.51,92,80,12,0,31,compaction_on`;
+
+  const fixedColors = {
+    hash_map_single: '#1f77b4',
+    hash_map_double: '#ff7f0e',
+    linear_base:     '#2ca02c',
+    quadratic_oracle:'#000000'
+  };
+  const fallbackPalette = ['#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf'];
+
+  let allRows = [];
+  const fileInput   = document.getElementById('file');
+  const useDefault  = document.getElementById('useDefault');
+  const metricSel   = document.getElementById('metric');
+  const toggleNlogN = document.getElementById('toggleNlogN');
+  const nlognWrap   = document.getElementById('nlognWrap');
+  const styleLegend = document.getElementById('styleLegend');
+  const metricNote  = document.getElementById('metricNote');
+
+  // Tooltip
+  const tooltip = d3.select('body').append('div')
+    .attr('class', 'tooltip')
+    .style('opacity', 0);
+
+  useDefault.addEventListener('click', () => {
+    const rows = d3.csvParse(defaultCsv.trim());
+    rows.forEach(r => coerceRow(r));
+    allRows = rows;
+    render();
+  });
+
+  metricSel.addEventListener('change', render);
+  toggleNlogN.addEventListener('change', render);
+
+  fileInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result.replace(/\r\n/g, '\n').trim();
+      const rows = d3.csvParse(text);
+      rows.forEach(r => coerceRow(r));
+      allRows = rows;
+      render();
+    };
+    reader.readAsText(f);
+  });
+
+  function toNum(v) {
+    const x = +v;
+    return Number.isFinite(x) ? x : NaN;
+  }
+  function coerceRow(r) {
+    r.N = +r.N;
+    r.elapsed_ms = toNum(r.elapsed_ms);
+    r.ops_total = toNum(r.ops_total);
+    r.average_probes = toNum(r.average_probes);
+    r.eff_load_factor_pct = toNum(r.eff_load_factor_pct);
+    r.load_factor_pct = toNum(r.load_factor_pct);
+    r.tombstones_pct = toNum(r.tombstones_pct);
+    r.full_scans = toNum(r.full_scans);
+    r.compactions = toNum(r.compactions);
+    r.compaction_state = r.compaction_state || '';
+    // Derived
+    r.ops_per_ms = (Number.isFinite(r.ops_total) && Number.isFinite(r.elapsed_ms) && r.elapsed_ms > 0)
+      ? (r.ops_total / r.elapsed_ms) : NaN;
+    r.ms_per_op = (Number.isFinite(r.ops_total) && Number.isFinite(r.elapsed_ms) && r.ops_total > 0)
+      ? (r.elapsed_ms / r.ops_total) : NaN;
+  }
+
+  function render() {
+    const metric = metricSel.value;
+    const isPercentMetric = (m) => (m === 'eff_load_factor_pct' || m === 'load_factor_pct' || m === 'tombstones_pct');
+    const percentMode = isPercentMetric(metric) || (metric === 'occupancy_trio_pct');
+
+    // Baseline only for elapsed_ms
+    const baselineAllowed = (metric === 'elapsed_ms');
+    nlognWrap.style.opacity = baselineAllowed ? '1' : '0.4';
+    toggleNlogN.disabled = !baselineAllowed;
+    if (!baselineAllowed) toggleNlogN.checked = false;
+
+    // Friendly note
+    metricNote.textContent =
+      metric === 'elapsed_ms' ? 'Time per run (lower is better).' :
+      metric === 'ops_per_ms' ? 'Overall throughput: operations completed per millisecond (higher is better).' :
+      metric === 'ms_per_op' ? 'Overall latency: milliseconds per operation (lower is better).' :
+      metric === 'average_probes' ? 'Average probes per op (lower is better).' :
+      metric === 'full_scans' ? 'Number of times a probe wrapped the entire table. Lower should correlate with healthier occupancy.' :
+      metric === 'compactions' ? 'Number of table compactions triggered for this run.' :
+      (metric === 'occupancy_trio_pct'
+        ? 'Three occupancy metrics together: effective (solid), load (dashed), tombstones (dotted).'
+        : 'Single occupancy metric (%).');
+
+    // Filter rows: N >= 1024
+    const rows0 = allRows.filter(r => Number.isFinite(r.N) && r.N >= 1024);
+
+    const container = d3.select('#chart');
+    container.selectAll('*').remove();
+
+    const margin = {top: 24, right: 34, bottom: 56, left: 76};
+    const width = Math.max(360, container.node().clientWidth) - margin.left - margin.right;
+    const height = 540 - margin.top - margin.bottom;
+
+    const svg = container.append('svg')
+      .attr('width', width + margin.left + margin.right)
+      .attr('height', height + margin.top + margin.bottom);
+
+    const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+    // Prepare data series
+    let series = [];
+    let yLabel = metric;
+
+    if (metric === 'occupancy_trio_pct') {
+      const byImplAll = d3.groups(rows0, d => d.impl);
+      series = [];
+      byImplAll.forEach(([impl, arr]) => {
+        const eff = arr.filter(r => Number.isFinite(r.eff_load_factor_pct)).map(r => ({...r, _metric: 'eff_load_factor_pct', _style: 'solid', value: r.eff_load_factor_pct})).sort((a,b)=>a.N-b.N);
+        const load = arr.filter(r => Number.isFinite(r.load_factor_pct)).map(r => ({...r, _metric: 'load_factor_pct', _style: 'dash', value: r.load_factor_pct})).sort((a,b)=>a.N-b.N);
+        const tomb = arr.filter(r => Number.isFinite(r.tombstones_pct)).map(r => ({...r, _metric: 'tombstones_pct', _style: 'dot', value: r.tombstones_pct})).sort((a,b)=>a.N-b.N);
+        if (eff.length) series.push({impl, metric:'eff_load_factor_pct', style:'solid', data: eff});
+        if (load.length) series.push({impl, metric:'load_factor_pct', style:'dash', data: load});
+        if (tomb.length) series.push({impl, metric:'tombstones_pct', style:'dot', data: tomb});
+      });
+      yLabel = 'occupancy (%)';
+      styleLegend.style.display = 'inline-flex';
+    } else {
+      styleLegend.style.display = 'none';
+      const rows = rows0.filter(r => Number.isFinite(r[metric]));
+      if (!rows.length) {
+        g.append('text').attr('x', width/2).attr('y', height/2 - 12)
+          .attr('text-anchor','middle').style('fill','#6b7280')
+          .text(`CSV has no column "${metric}" for N ≥ 2¹⁰`);
+        g.append('text').attr('x', width/2).attr('y', height/2 + 12)
+          .attr('text-anchor','middle').style('fill','#6b7280')
+          .text('Pick another metric or load a CSV that includes it.');
+        d3.select('#legend').html('');
+        return;
+      }
+      const byImpl = d3.groups(rows, d => d.impl);
+      series = byImpl.map(([impl, arr]) => ({
+        impl,
+        metric,
+        style: 'solid',
+        data: arr.sort((a,b)=>a.N-b.N).map(r => ({...r, value: r[metric], _metric: metric, _style: 'solid'}))
+      }));
+      yLabel = metric === 'elapsed_ms' ? 'elapsed_ms'
+             : metric === 'ops_per_ms' ? 'ops/ms'
+             : metric === 'ms_per_op' ? 'ms/op'
+             : metric === 'average_probes' ? 'average_probes'
+             : metric === 'full_scans' ? 'full_scans'
+             : metric === 'compactions' ? 'compactions'
+             : (metric.indexOf('_pct') !== -1 ? metric.replace('_pct',' (%)') : metric);
+    }
+
+    // X axis (log2)
+    const allPoints = series.flatMap(s => s.data);
+    const Nmin = d3.min(allPoints, d => d.N);
+    const Nmax = d3.max(allPoints, d => d.N);
+    if (!Number.isFinite(Nmin) || !Number.isFinite(Nmax)) {
+      d3.select('#legend').html('');
+      return;
+    }
+    const minPow = Math.max(10, Math.ceil(Math.log2(Nmin)));
+    const maxPow = Math.floor(Math.log2(Nmax));
+    const xTicks = d3.range(minPow, maxPow + 1).map(k => 2 ** k);
+    const x = d3.scaleLog().base(2).domain([2 ** minPow, 2 ** maxPow]).range([0, width]);
+
+    // Y axis
+    const yMax = (metric === 'elapsed_ms' || metric === 'average_probes' || metric === 'ops_per_ms' || metric === 'ms_per_op' || metric === 'full_scans' || metric === 'compactions')
+      ? d3.max(allPoints, d => d.value)
+      : 100;
+    const y = d3.scaleLinear().domain([0, yMax]).nice().range([height, 0]);
+
+    // Axes & grid
+    const xAxis = d3.axisBottom(x).tickValues(xTicks).tickFormat(d => `2^${Math.round(Math.log2(d))}`);
+    const yAxis = d3.axisLeft(y).ticks(8);
+    const xGrid = d3.axisBottom(x).tickValues(xTicks).tickSize(-height).tickFormat('');
+    const yGrid = d3.axisLeft(y).ticks(8).tickSize(-width).tickFormat('');
+
+    g.append('g').attr('class','grid').attr('transform', `translate(0,${height})`).call(xGrid);
+    g.append('g').attr('class','grid').call(yGrid);
+    g.append('g').attr('class','axis').attr('transform', `translate(0,${height})`).call(xAxis);
+    g.append('g').attr('class','axis').call(yAxis);
+
+    g.append('text').attr('x', width/2).attr('y', height+42).attr('text-anchor','middle').text('N (2^k)');
+    g.append('text').attr('transform','rotate(-90)').attr('x', -height/2).attr('y', -56).attr('text-anchor','middle').text(yLabel);
+
+    // Colors by impl
+    const implList = Array.from(new Set(series.map(s => s.impl)));
+    const color = (impl) => fixedColors[impl] || fallbackPalette[implList.indexOf(impl) % fallbackPalette.length];
+
+    // Line styles
+    function dashFor(style) { return style === 'dash' ? '6,4' : (style === 'dot' ? '2,3' : null); }
+    const line = d3.line().x(d => x(d.N)).y(d => y(d.value)).curve(d3.curveMonotoneX);
+
+    // Draw series
+    series.forEach(s => {
+      const col = color(s.impl);
+      g.append('path')
+        .datum(s.data)
+        .attr('fill','none')
+        .attr('stroke', col)
+        .attr('stroke-width', 2.5)
+        .attr('stroke-dasharray', dashFor(s.style) || null)
+        .attr('d', line);
+
+      g.selectAll(`.pt-${cssSafe(s.impl)}-${s.metric}`)
+        .data(s.data)
+        .enter().append('circle')
+        .attr('class', `pt-${cssSafe(s.impl)}-${s.metric}`)
+        .attr('r', 3.5)
+        .attr('cx', d => x(d.N))
+        .attr('cy', d => y(d.value))
+        .attr('fill', col)
+        .on('mouseenter', function(evt, d) {
+          const k = Math.log2(d.N);
+          const powLabel = Number.isInteger(k) ? ` (2^${k})` : '';
+          let metricName = (d._metric === 'eff_load_factor_pct') ? 'effective %'
+                           : (d._metric === 'load_factor_pct') ? 'load %'
+                           : (d._metric === 'tombstones_pct') ? 'tombstones %'
+                           : (d._metric || metric);
+          const isPct = (metricName.includes('%') || (d._metric && d._metric.endsWith('_pct')) || (metric && metric.endsWith('_pct')));
+          let valStr;
+          if (isPct) {
+            valStr = `${(+d.value).toFixed(1)}%`;
+          } else if (metricName === 'ops_per_ms') {
+            const opsPerS = d.value * 1000;
+            valStr = `${(+d.value).toFixed(3)} ops/ms  (${opsPerS.toFixed(0)} ops/s)`;
+          } else if (metricName === 'ms_per_op') {
+            valStr = `${(+d.value).toFixed(6)} ms/op`;
+          } else if (metricName === 'full_scans' || metricName === 'compactions') {
+            valStr = `${Math.round(+d.value)}`;
+          } else {
+            valStr = (+d.value).toFixed(3);
+          }
+          const html = `<div class="hdr">${d.impl}</div>
+                        <div class="sub">N = ${d.N}${powLabel}</div>
+                        <div>${metricName} = ${valStr}</div>
+                        <div class="sub">seed ${d.seed ?? '—'} • ${d.profile ?? ''} • ${d.compaction_state || ''}</div>`;
+          tooltip.html(html).style('opacity', 1).style('border-left', `4px solid ${col}`);
+          d3.select(this).attr('r', 5.5);
+        })
+        .on('mousemove', function(evt) {
+          const pad = 12;
+          tooltip.style('left', `${evt.clientX + pad}px`).style('top', `${evt.clientY + pad}px`);
+        })
+        .on('mouseleave', function() {
+          tooltip.style('opacity', 0);
+          d3.select(this).attr('r', 3.5);
+        });
+    });
+
+    // Optional N log N baseline (elapsed only)
+    if ((metric === 'elapsed_ms') && toggleNlogN.checked) {
+      const leftN = d3.min(series.flatMap(s => s.data.map(d => d.N)));
+      const leftVals = series.flatMap(s => s.data.filter(d => d.N === leftN && Number.isFinite(d.elapsed_ms)).map(d => d.elapsed_ms));
+      if (leftVals.length) {
+        const ref = d3.mean(leftVals);
+        const scale = ref / (leftN * Math.log2(leftN));
+        const baseline = d3.range(Math.log2(x.domain()[0]), Math.log2(x.domain()[1]) + 1)
+          .map(k => ({ N: 2**k, y: scale * (2**k) * k }));
+        const bl = d3.line().x(d => x(d.N)).y(d => y(d.y)).curve(d3.curveMonotoneX);
+        g.append('path')
+          .datum(baseline)
+          .attr('fill','none')
+          .attr('stroke','#6b7280')
+          .attr('stroke-dasharray','6,4')
+          .attr('stroke-width',2)
+          .attr('d', bl);
+      }
+    }
+
+    // Legend by impl (with compaction state)
+    const legend = d3.select('#legend');
+    legend.html('');
+    const byImpl = d3.groups(allRows, d => d.impl);
+    byImpl.forEach(([impl, rows]) => {
+      const states = Array.from(new Set(rows.map(r => r.compaction_state).filter(Boolean)));
+      const stateLabel = states.length === 0 ? '' : (states.length === 1 ? states[0] : 'mixed');
+      const item = legend.append('div').attr('class','badge');
+      item.append('span').attr('class', 'dot').style('background', color(impl));
+      item.append('span').text(impl + (stateLabel ? ` — ${stateLabel}` : ''));
+    });
+  }
+
+  function cssSafe(s) { return String(s).replace(/[^a-zA-Z0-9_-]/g, '_'); }
+
+  // Auto-load default on first paint
+  (function init() {
+    const rows = d3.csvParse(defaultCsv.trim());
+    rows.forEach(r => coerceRow(r));
+    allRows = rows;
+    render();
+  })();
+  </script>
+</body>
+</html>
